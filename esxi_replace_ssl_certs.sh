@@ -2,14 +2,61 @@
 
 # -----------------------------------------------------------------------------
 # scripts/esxi_replace_ssl_certs.sh
-# Version: 1.0.4
+# Version: 1.2.5
 # -----------------------------------------------------------------------------
-
-# Script to replace SSL certificates on ESXi 7 host
-# This script performs the following tasks:
-# 1. Replace SSL certificate (rui.crt)
-# 2. Replace SSL private key (rui.key)
-# 3. Restart hostd service
+# ESXi SSL Certificate Replacement Script
+#
+# This script automates the process of replacing SSL certificates on VMware ESXi 7.x hosts.
+# It provides a comprehensive solution for updating both the certificate (rui.crt) and
+# private key (rui.key) files used by the ESXi web interface and management services.
+#
+# FEATURES:
+# - Automatic SSH connection handling (supports both SSH keys and password authentication)
+# - SSH alias support (works seamlessly with SSH config files and includes)
+# - Comprehensive SSL certificate validation (format, expiration, key matching)
+# - Automatic backup of existing certificates with timestamps
+# - Proper file permission handling (ESXi requires specific permissions for SSL files)
+# - Service restart automation (hostd service restart to apply new certificates)
+# - Complete verification of installation success
+# - Detailed logging with timestamps (both console and file output)
+# - HTTPS connectivity testing to verify certificate functionality
+#
+# USAGE:
+# 1. Configure the variables in the CONFIGURATION section below:
+#    - ESXI_HOST: IP address, FQDN, or SSH alias of your ESXi host
+#    - ESXI_PASSWORD: Leave empty to be prompted securely (recommended for SSH aliases)
+#    - SSL_CERT_FILE: Path to your SSL certificate file
+#    - SSL_KEY_FILE: Path to your SSL private key file
+#
+# 2. Ensure prerequisites are met:
+#    - sshpass installed (if using password authentication)
+#    - SSH access to ESXi host enabled
+#    - Valid SSL certificate and private key files
+#
+# 3. Execute the script: ./esxi_replace_ssl_certs.sh
+#
+# AUTHENTICATION METHODS:
+# - SSH Key: Automatically detected and used if available (recommended)
+# - Password: Prompted securely if SSH key authentication fails
+# - SSH Aliases: Fully supported through SSH config files and includes
+#
+# SAFETY FEATURES:
+# - Automatic backup of existing certificates before replacement
+# - Comprehensive validation of certificate files before installation
+# - Verification that certificate and private key match
+# - Service status checks to ensure proper operation after changes
+#
+# OUTPUT:
+# - Real-time progress logging to console
+# - Complete execution log saved to timestamped file
+# - Detailed verification of all operations performed
+#
+# REQUIREMENTS:
+# - VMware ESXi 7.x host with SSH enabled
+# - Linux/Unix system with bash, ssh, and openssl
+# - Network connectivity to ESXi host
+# - Valid SSL certificate and private key files in PEM format
+# -----------------------------------------------------------------------------
 
 set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
@@ -21,6 +68,9 @@ set -euo pipefail  # Exit on error, undefined vars, pipe failures
 ESXI_HOST="172.16.250.6"                    # ESXi host IP or FQDN
 ESXI_USER="root"                              # ESXi username (usually root)
 ESXI_PASSWORD=""       # ESXi password
+
+# Global variable to track authentication method
+USE_SSH_KEY_AUTH=false
 
 # SSL certificate file paths
 SSL_CERT_FILE="~/Projects/git.certgen/domains/lan/certs/vmware.lan-fullchain.crt" # Path to SSL certificate file
@@ -42,6 +92,8 @@ ESXI_KEY_PATH="/etc/vmware/ssl/rui.key"
 # =============================================================================
 
 log() {
+    # Log messages with timestamp to both stderr and optional log file
+    # Parameters: $1 = message to log
     local message="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
     echo "$message" >&2
     
@@ -51,14 +103,17 @@ log() {
     fi
 }
 
-
 error_exit() {
+    # Log error message and exit with status 1
+    # Parameters: $1 = error message
     log "ERROR: $1"
     exit 1
 }
 
-
 expand_path() {
+    # Expand tilde (~) in file paths to full home directory path
+    # Parameters: $1 = path to expand
+    # Returns: expanded path
     local path="$1"
     # Expand tilde to home directory
     if [[ "$path" =~ ^~/ ]]; then
@@ -69,9 +124,9 @@ expand_path() {
     echo "$path"
 }
 
-
-
 check_configuration() {
+    # Validate configuration variables and detect SSH aliases
+    # Prompts for password if needed and not using SSH key authentication
     log "Checking configuration..."
     
     # Check if configuration variables are properly set
@@ -98,6 +153,7 @@ check_configuration() {
         fi
     fi
     
+    # Validate SSL file path configuration
     if [[ "$SSL_CERT_FILE" == "/path/to/your/certificate.crt" ]]; then
         error_exit "Please update SSL_CERT_FILE with the path to your SSL certificate"
     fi
@@ -109,9 +165,9 @@ check_configuration() {
     log "Configuration check passed"
 }
 
-
-
 prompt_for_password() {
+    # Securely prompt user for ESXi password (hidden input)
+    # Updates global ESXI_PASSWORD variable
     log "Prompting for ESXi password..."
     
     # Check if we're in an interactive terminal
@@ -133,6 +189,8 @@ prompt_for_password() {
 }
 
 check_prerequisites() {
+    # Validate required tools and SSL certificate files exist and are readable
+    # Expands file paths and performs basic file validation
     log "Checking prerequisites..."
     
     # Check if required tools are available
@@ -158,27 +216,22 @@ check_prerequisites() {
 
 
 test_ssh_connection() {
+    # Test SSH connectivity to ESXi host, handling both SSH keys and password authentication
+    # Always tries SSH key authentication first, regardless of host format
+    # Sets global USE_SSH_KEY_AUTH variable based on successful authentication method
     log "Testing SSH connection to $ESXI_HOST..."
     
-    # Check if ESXI_HOST might be an SSH alias
-    local is_alias=false
-    if [[ ! "$ESXI_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ ! "$ESXI_HOST" =~ \. ]]; then
-        # Looks like it could be an alias (not an IP and no dots for FQDN)
-        if [[ -f "$HOME/.ssh/config" ]] && grep -q "^Host $ESXI_HOST$" "$HOME/.ssh/config" 2>/dev/null; then
-            is_alias=true
-            log "Detected SSH alias '$ESXI_HOST' in ~/.ssh/config"
-            
-            # Try SSH key authentication first for aliases
-            if ssh $SSH_OPTS "$ESXI_USER@$ESXI_HOST" "echo 'SSH connection successful'" >/dev/null 2>&1; then
-                log "SSH connection to $ESXI_HOST successful (using SSH key)"
-                return 0
-            else
-                log "SSH key authentication failed, need password"
-            fi
-        fi
+    # Always try SSH key authentication first
+    log "Attempting SSH key authentication..."
+    if ssh $SSH_OPTS "$ESXI_USER@$ESXI_HOST" "echo 'SSH connection successful'" >/dev/null 2>&1; then
+        log "SSH connection to $ESXI_HOST successful (using SSH key)"
+        USE_SSH_KEY_AUTH=true
+        return 0
+    else
+        log "SSH key authentication failed, trying password authentication"
     fi
     
-    # If we reach here, we need password authentication
+    # If SSH key failed, try password authentication
     if [[ -z "$ESXI_PASSWORD" ]]; then
         log "ESXi password required for connection"
         prompt_for_password
@@ -186,44 +239,64 @@ test_ssh_connection() {
     
     # Test password-based connection
     if sshpass -p "$ESXI_PASSWORD" ssh $SSH_OPTS "$ESXI_USER@$ESXI_HOST" "echo 'SSH connection successful'" >/dev/null 2>&1; then
-        log "SSH connection to $ESXI_HOST successful"
+        log "SSH connection to $ESXI_HOST successful (using password)"
+        USE_SSH_KEY_AUTH=false
     else
-        if [[ "$is_alias" == true ]]; then
-            error_exit "Cannot establish SSH connection to alias '$ESXI_HOST'. Check if the alias is correctly configured in ~/.ssh/config and the target host is reachable."
-        else
-            error_exit "Cannot establish SSH connection to $ESXI_HOST"
-        fi
+        error_exit "Cannot establish SSH connection to $ESXI_HOST using either SSH key or password authentication"
     fi
 }
 
 
 
 execute_remote_command() {
+    # Execute command on remote ESXi host via SSH and capture output
+    # Uses authentication method determined in test_ssh_connection()
+    # Parameters: $1 = command to execute, $2 = description for logging
     local command="$1"
     local description="$2"
 
     log "Executing: $description"
 
-    # Execute command and capture output
+    # Execute command and capture output using the appropriate authentication method
     local output
     
-    # Use password authentication (since we know it works from test_ssh_connection)
-    if output=$(sshpass -p "$ESXI_PASSWORD" ssh $SSH_OPTS "$ESXI_USER@$ESXI_HOST" "$command" 2>&1); then
-        while IFS= read -r line; do
-            echo "$line" >&2
-            if [[ -n "${LOG_FILE:-}" ]]; then
-                echo "$line" >> "$LOG_FILE"
-            fi
-        done <<< "$output"
-        log "Successfully executed: $description"
-        return 0
+    if [[ "$USE_SSH_KEY_AUTH" == true ]]; then
+        # Use SSH key authentication
+        if output=$(ssh $SSH_OPTS "$ESXI_USER@$ESXI_HOST" "$command" 2>&1); then
+            # Log each line of output to both console and file
+            while IFS= read -r line; do
+                echo "$line" >&2
+                if [[ -n "${LOG_FILE:-}" ]]; then
+                    echo "$line" >> "$LOG_FILE"
+                fi
+            done <<< "$output"
+            log "Successfully executed: $description"
+            return 0
+        else
+            error_exit "Failed to execute: $description (SSH key authentication failed)"
+        fi
     else
-        error_exit "Failed to execute: $description"
+        # Use password authentication
+        if output=$(sshpass -p "$ESXI_PASSWORD" ssh $SSH_OPTS "$ESXI_USER@$ESXI_HOST" "$command" 2>&1); then
+            # Log each line of output to both console and file
+            while IFS= read -r line; do
+                echo "$line" >&2
+                if [[ -n "${LOG_FILE:-}" ]]; then
+                    echo "$line" >> "$LOG_FILE"
+                fi
+            done <<< "$output"
+            log "Successfully executed: $description"
+            return 0
+        else
+            error_exit "Failed to execute: $description (password authentication failed)"
+        fi
     fi
 }
 
 
 validate_ssl_files() {
+    # Comprehensive validation of SSL certificate and private key files
+    # Performs format validation, openssl verification, expiration checks, and key matching
     log "Validating SSL certificate and private key..."
     
     # Read certificate and key content
@@ -258,7 +331,7 @@ validate_ssl_files() {
     if command -v openssl >/dev/null 2>&1; then
         log "Performing additional validation with openssl..."
         
-        # Validate certificate
+        # Validate certificate structure and parse details
         if openssl x509 -in "$SSL_CERT_FILE" -noout -text >/dev/null 2>&1; then
             log "SSL certificate is valid (verified with openssl)"
             
@@ -270,7 +343,7 @@ validate_ssl_files() {
             log "  Certificate Subject: $cert_subject"
             log "  $cert_dates"
             
-            # Check if certificate is expired
+            # Check if certificate is expired or expiring soon
             local end_date
             end_date=$(openssl x509 -in "$SSL_CERT_FILE" -noout -enddate 2>/dev/null | cut -d'=' -f2)
             if [[ -n "$end_date" ]]; then
@@ -293,14 +366,14 @@ validate_ssl_files() {
             error_exit "SSL certificate validation failed with openssl"
         fi
         
-        # Validate private key
+        # Validate private key structure
         if openssl rsa -in "$SSL_KEY_FILE" -check -noout >/dev/null 2>&1 || openssl pkey -in "$SSL_KEY_FILE" -check -noout >/dev/null 2>&1; then
             log "SSL private key is valid (verified with openssl)"
         else
             error_exit "SSL private key validation failed with openssl"
         fi
         
-        # Validate certificate and key match
+        # Validate certificate and private key match (critical security check)
         local cert_modulus key_modulus
         cert_modulus=$(openssl x509 -noout -modulus -in "$SSL_CERT_FILE" 2>/dev/null | openssl md5 2>/dev/null || echo "")
         key_modulus=$(openssl rsa -noout -modulus -in "$SSL_KEY_FILE" 2>/dev/null | openssl md5 2>/dev/null || \
@@ -317,12 +390,14 @@ validate_ssl_files() {
 }
 
 backup_existing_certificates() {
+    # Create timestamped backup copies of existing SSL certificates before replacement
+    # Backups are stored with .backup.YYYYMMDD_HHMMSS suffix
     log "Creating backup of existing SSL certificates..."
     
     local backup_cmd="
         BACKUP_SUFFIX=\$(date +%Y%m%d_%H%M%S)
         
-        # Check if current certificates exist
+        # Check if current certificates exist and create backups
         if [ -f $ESXI_CERT_PATH ]; then
             cp $ESXI_CERT_PATH ${ESXI_CERT_PATH}.backup.\$BACKUP_SUFFIX
             echo 'Certificate backup created: ${ESXI_CERT_PATH}.backup.'\$BACKUP_SUFFIX
@@ -344,9 +419,12 @@ backup_existing_certificates() {
 }
 
 replace_ssl_certificates() {
+    # Replace SSL certificate and private key files on ESXi host
+    # Handles file permissions properly (rui.key has read-only permissions by default)
+    # Process: prepare files -> replace certificate -> replace key -> set permissions -> verify
     log "Replacing SSL certificates on ESXi host..."
     
-    # Read certificate and key content
+    # Read certificate and key content from local files
     local ssl_certificate ssl_private_key
     ssl_certificate=$(cat "$SSL_CERT_FILE") || error_exit "Failed to read SSL certificate file: $SSL_CERT_FILE"
     ssl_private_key=$(cat "$SSL_KEY_FILE") || error_exit "Failed to read SSL private key file: $SSL_KEY_FILE"
@@ -363,7 +441,7 @@ replace_ssl_certificates() {
     "
     execute_remote_command "$prep_cmd" "Preparing SSL file replacement"
     
-    # Step 2: Replace SSL certificate
+    # Step 2: Replace SSL certificate file
     log "Step 2: Replacing SSL certificate file..."
     local cert_cmd="
         echo 'Replacing SSL certificate...'
@@ -374,7 +452,7 @@ EOF_CERT
     "
     execute_remote_command "$cert_cmd" "Replacing SSL certificate file"
     
-    # Step 3: Replace SSL private key
+    # Step 3: Replace SSL private key file
     log "Step 3: Replacing SSL private key file..."
     local key_cmd="
         echo 'Replacing SSL private key...'
@@ -385,7 +463,7 @@ EOF_KEY
     "
     execute_remote_command "$key_cmd" "Replacing SSL private key file"
     
-    # Step 4: Set final permissions
+    # Step 4: Set final file permissions (400 for key, 644 for certificate)
     log "Step 4: Setting final file permissions..."
     local perm_cmd="
         chmod 400 $ESXI_KEY_PATH
@@ -395,7 +473,7 @@ EOF_KEY
     "
     execute_remote_command "$perm_cmd" "Setting final SSL file permissions"
     
-    # Step 5: Verify files
+    # Step 5: Verify files were created properly
     log "Step 5: Verifying SSL files..."
     local verify_cmd="
         if [ -f $ESXI_CERT_PATH ] && [ -f $ESXI_KEY_PATH ]; then
@@ -412,27 +490,30 @@ EOF_KEY
     execute_remote_command "$verify_cmd" "Verifying SSL certificate installation"
 }
 
-
 restart_hostd_service() {
+    # Restart ESXi hostd service to apply new SSL certificates
+    # Uses stop/start sequence with appropriate wait times for service stability
     log "Restarting hostd service..."
     
     # Stop hostd service first
     execute_remote_command "/etc/init.d/hostd stop" "Stopping hostd service"
     
-    # Wait a moment
+    # Wait for service to fully stop
     sleep 3
     
     # Start hostd service
     execute_remote_command "/etc/init.d/hostd start" "Starting hostd service"
     
-    # Wait for service to fully start
+    # Wait for service to fully start and initialize
     sleep 5
     
-    # Check service status
+    # Verify service is running
     execute_remote_command "/etc/init.d/hostd status" "Checking hostd service status"
 }
 
 verify_ssl_installation() {
+    # Comprehensive verification of SSL certificate installation
+    # Checks file existence, permissions, content parsing, and service status
     log "Verifying SSL certificate installation..."
     
     local verify_cmd="
@@ -463,6 +544,8 @@ verify_ssl_installation() {
 }
 
 test_https_connection() {
+    # Test HTTPS connectivity to ESXi web interface to verify SSL certificate functionality
+    # Uses curl or wget to perform basic connectivity test
     log "Testing HTTPS connection to ESXi host..."
     
     if command -v curl >/dev/null 2>&1; then
@@ -489,7 +572,10 @@ test_https_connection() {
 # =============================================================================
 
 main() {
-    # Setup logging
+    # Main script execution flow with comprehensive logging and error handling
+    # Sets up logging, validates inputs, performs SSL certificate replacement, and verifies results
+    
+    # Setup logging with timestamp
     local log_timestamp
     log_timestamp=$(date '+%y%m%d_%H%M%S')
     LOG_FILE="esxi_replace_ssl_certs-${log_timestamp}.log"
@@ -498,34 +584,34 @@ main() {
     log "Target host: $ESXI_HOST"
     log "Log file: $(pwd)/$LOG_FILE"
     
-    # Expand and display the SSL file paths early
+    # Expand and display the SSL file paths early for verification
     SSL_CERT_FILE=$(expand_path "$SSL_CERT_FILE")
     SSL_KEY_FILE=$(expand_path "$SSL_KEY_FILE")
     log "SSL certificate file: $SSL_CERT_FILE"
     log "SSL private key file: $SSL_KEY_FILE"
     
-    # Step 1: Check prerequisites first (file validation)
+    # Step 1: Check prerequisites first (tools and file validation ONLY)
     check_prerequisites
     
-    # Step 2: Validate SSL files
+    # Step 2: Validate SSL certificate and key files
     validate_ssl_files
     
-    # Step 3: Test SSH connection BEFORE asking for password
+    # Step 3: Test SSH connection FIRST (this sets USE_SSH_KEY_AUTH)
     test_ssh_connection
     
-    # Step 4: Backup existing certificates
+    # Step 4: Create backup of existing certificates
     backup_existing_certificates
     
-    # Step 5: Replace SSL certificates
+    # Step 5: Replace SSL certificates with new ones
     replace_ssl_certificates
     
-    # Step 6: Restart hostd service
+    # Step 6: Restart hostd service to apply changes
     restart_hostd_service
     
-    # Step 7: Verify SSL installation
+    # Step 7: Verify SSL certificate installation
     verify_ssl_installation
     
-    # Step 8: Test HTTPS connection
+    # Step 8: Test HTTPS connectivity
     test_https_connection
     
     log "SSL certificate replacement completed successfully!"
@@ -534,12 +620,13 @@ main() {
     log "Complete log saved to: $(pwd)/$LOG_FILE"
 }
 
+
 # =============================================================================
 # SCRIPT EXECUTION
 # =============================================================================
 
-# Check if script is being sourced or executed
+# Check if script is being sourced or executed directly
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    # Script is being executed directly
+    # Script is being executed directly - run main function
     main "$@"
 fi
