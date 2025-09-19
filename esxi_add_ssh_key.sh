@@ -2,13 +2,63 @@
 
 # -----------------------------------------------------------------------------
 # scripts/esxi_add_ssh_key.sh
-# Version: 1.1.3
+# Version: 1.2.1
 # -----------------------------------------------------------------------------
-
-# Script to add SSH public key to ESXi 7 host
-# This script performs the following tasks:
-# 1. Add SSH public key to authorized_keys
-# 2. Restart SSH service
+# ESXi SSH Key Installation Script
+#
+# This script automates the process of adding SSH public keys to VMware ESXi 7.x hosts
+# to enable passwordless SSH authentication. It provides a secure and reliable method
+# for configuring SSH key-based access to ESXi management interfaces.
+#
+# FEATURES:
+# - Automatic SSH connection handling (password-based authentication for initial setup)
+# - Comprehensive SSH key validation (format, type, and structure verification)
+# - Automatic backup of existing authorized_keys before modifications
+# - Duplicate key detection (prevents adding the same key multiple times)
+# - Proper file permission handling (ESXi requires specific permissions for SSH files)
+# - SSH service restart automation to apply changes
+# - Complete verification of key installation success
+# - Detailed logging with timestamps (both console and file output)
+# - Optional SSH key authentication testing
+#
+# USAGE:
+# 1. Configure the variables in the CONFIGURATION section below:
+#    - ESXI_HOST: IP address, FQDN, or SSH alias of your ESXi host
+#    - ESXI_PASSWORD: Leave empty to be prompted securely (recommended)
+#    - PUBKEY_FILE: Path to your SSH public key file
+#
+# 2. Ensure prerequisites are met:
+#    - sshpass installed for initial password authentication
+#    - SSH access to ESXi host enabled
+#    - Valid SSH public key file (RSA keys recommended for ESXi 7.x)
+#
+# 3. Execute the script: ./esxi_add_ssh_key.sh
+#
+# AUTHENTICATION PROCESS:
+# - Initial Setup: Uses password authentication to install the SSH key
+# - Post-Installation: Enables passwordless SSH key authentication
+# - Verification: Tests both installation success and key functionality
+#
+# SAFETY FEATURES:
+# - Automatic backup of existing authorized_keys file
+# - Duplicate key detection and prevention
+# - Comprehensive validation of SSH key format and structure
+# - Service status verification after changes
+# - Non-destructive operation (existing keys are preserved)
+#
+# OUTPUT:
+# - Real-time progress logging to console
+# - Complete execution log saved to timestamped file
+# - Display of authorized_keys content for verification
+# - SSH key authentication test results
+#
+# REQUIREMENTS:
+# - VMware ESXi 7.x host with SSH enabled
+# - Linux/Unix system with bash, ssh, and sshpass
+# - Network connectivity to ESXi host
+# - Valid SSH public key file (preferably RSA for ESXi compatibility)
+# - Initial password access to ESXi host
+# -----------------------------------------------------------------------------
 
 set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
@@ -37,6 +87,8 @@ SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o Connect
 # =============================================================================
 
 log() {
+    # Log messages with timestamp to both stderr and optional log file
+    # Parameters: $1 = message to log
     local message="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
     echo "$message" >&2
     
@@ -46,13 +98,17 @@ log() {
     fi
 }
 
-
 error_exit() {
+    # Log error message and exit with status 1
+    # Parameters: $1 = error message
     log "ERROR: $1"
     exit 1
 }
 
 expand_path() {
+    # Expand tilde (~) in file paths to full home directory path
+    # Parameters: $1 = path to expand
+    # Returns: expanded path
     local path="$1"
     # Expand tilde to home directory
     if [[ "$path" =~ ^~/ ]]; then
@@ -63,8 +119,9 @@ expand_path() {
     echo "$path"
 }
 
-
 check_configuration() {
+    # Validate basic configuration variables and prompt for password if needed
+    # Ensures ESXI_HOST is configured and handles password input securely
     log "Checking configuration..."
 
     # Check if configuration variables are properly set
@@ -82,6 +139,8 @@ check_configuration() {
 }
 
 prompt_for_password() {
+    # Securely prompt user for ESXi password (hidden input)
+    # Updates global ESXI_PASSWORD variable
     log "Prompting for ESXi password..."
 
     # Check if we're in an interactive terminal
@@ -103,6 +162,8 @@ prompt_for_password() {
 }
 
 check_prerequisites() {
+    # Validate required tools and SSH public key file exist and are readable
+    # Expands file paths and performs basic file validation
     log "Checking prerequisites..."
 
     # Check if required tools are available
@@ -123,6 +184,8 @@ check_prerequisites() {
 }
 
 test_ssh_connection() {
+    # Test SSH connectivity to ESXi host using password authentication
+    # Verifies that the host is reachable and credentials are correct
     log "Testing SSH connection to $ESXI_HOST..."
 
     if sshpass -p "$ESXI_PASSWORD" ssh $SSH_OPTS "$ESXI_USER@$ESXI_HOST" "echo 'SSH connection successful'" >/dev/null 2>&1; then
@@ -132,8 +195,10 @@ test_ssh_connection() {
     fi
 }
 
-
 execute_remote_command() {
+    # Execute command on remote ESXi host via SSH and capture output
+    # Logs both command execution and output to console and log file
+    # Parameters: $1 = command to execute, $2 = description for logging
     local command="$1"
     local description="$2"
 
@@ -142,7 +207,7 @@ execute_remote_command() {
     # Execute command and capture output
     local output
     if output=$(sshpass -p "$ESXI_PASSWORD" ssh $SSH_OPTS "$ESXI_USER@$ESXI_HOST" "$command" 2>&1); then
-        # Log each line of output
+        # Log each line of output to both console and file
         while IFS= read -r line; do
             echo "$line" >&2
             if [[ -n "${LOG_FILE:-}" ]]; then
@@ -157,8 +222,9 @@ execute_remote_command() {
     fi
 }
 
-
 validate_ssh_key() {
+    # Comprehensive validation of SSH public key file
+    # Performs format validation and extracts key information for logging
     log "Validating SSH public key..."
 
     # Read the SSH public key content
@@ -170,6 +236,7 @@ validate_ssh_key() {
         error_exit "Invalid SSH public key format in file: $PUBKEY_FILE"
     fi
 
+    # Extract key information for logging
     local key_type comment
     key_type=$(echo "$ssh_public_key" | cut -d' ' -f1)
     comment=$(echo "$ssh_public_key" | cut -d' ' -f3- || echo "no comment")
@@ -180,9 +247,9 @@ validate_ssh_key() {
     log "  File size: $(wc -c < "$PUBKEY_FILE") bytes"
 }
 
-
-
 add_ssh_key() {
+    # Add SSH public key to ESXi authorized_keys file with proper handling
+    # Creates backup, checks for duplicates, sets permissions, and reports results
     log "Adding SSH public key to authorized_keys..."
 
     # Read the SSH public key content
@@ -220,8 +287,9 @@ add_ssh_key() {
     execute_remote_command "$add_key_cmd" "Adding SSH public key"
 }
 
-
 restart_ssh_service() {
+    # Restart ESXi SSH service to apply new key configuration
+    # Uses standard ESXi service management commands with status verification
     log "Restarting SSH service..."
 
     # Restart SSH service
@@ -232,9 +300,9 @@ restart_ssh_service() {
     execute_remote_command "/etc/init.d/SSH status" "Checking SSH service status"
 }
 
-
-
 verify_ssh_key() {
+    # Comprehensive verification of SSH key installation
+    # Checks key presence, file permissions, and displays authorized_keys content
     log "Verifying SSH key installation..."
 
     # Read SSH key for verification
@@ -264,8 +332,9 @@ verify_ssh_key() {
     execute_remote_command "$verify_cmd" "Verifying SSH key installation"
 }
 
-
 test_key_authentication() {
+    # Test SSH key authentication by attempting connection with private key
+    # Optional verification step to confirm end-to-end functionality
     log "Testing SSH key authentication..."
 
     # Expand the private key path (assuming it's in the same directory as public key)
@@ -291,7 +360,10 @@ test_key_authentication() {
 # =============================================================================
 
 main() {
-    # Setup logging
+    # Main script execution flow with comprehensive logging and error handling
+    # Sets up logging, validates inputs, installs SSH key, and verifies installation
+    
+    # Setup logging with timestamp
     local log_timestamp
     log_timestamp=$(date '+%y%m%d_%H%M%S')
     LOG_FILE="esxi_add_ssh_key-${log_timestamp}.log"
@@ -300,32 +372,32 @@ main() {
     log "Target host: $ESXI_HOST"
     log "Log file: $(pwd)/$LOG_FILE"
     
-    # Expand and display the SSH key path early
+    # Expand and display the SSH key path early for verification
     PUBKEY_FILE=$(expand_path "$PUBKEY_FILE")
     log "SSH key file: $PUBKEY_FILE"
 
-    # Step 1: Check configuration
+    # Step 1: Check basic configuration
     check_configuration
 
-    # Step 2: Check prerequisites
+    # Step 2: Check prerequisites (tools and files)
     check_prerequisites
 
-    # Step 3: Validate SSH key
+    # Step 3: Validate SSH key format and structure
     validate_ssh_key
 
-    # Step 4: Test SSH connection
+    # Step 4: Test SSH connection with password
     test_ssh_connection
 
-    # Step 5: Add SSH public key
+    # Step 5: Add SSH public key to authorized_keys
     add_ssh_key
 
-    # Step 6: Restart SSH service
+    # Step 6: Restart SSH service to apply changes
     restart_ssh_service
 
-    # Step 7: Verify SSH key installation
+    # Step 7: Verify SSH key installation success
     verify_ssh_key
 
-    # Step 8: Test key authentication (optional)
+    # Step 8: Test key authentication (optional verification)
     test_key_authentication
 
     log "SSH key installation completed successfully!"
@@ -334,13 +406,12 @@ main() {
     log "Complete log saved to: $(pwd)/$LOG_FILE"
 }
 
-
 # =============================================================================
 # SCRIPT EXECUTION
 # =============================================================================
 
-# Check if script is being sourced or executed
+# Check if script is being sourced or executed directly
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    # Script is being executed directly
+    # Script is being executed directly - run main function
     main "$@"
 fi
