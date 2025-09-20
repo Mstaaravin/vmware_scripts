@@ -2,7 +2,7 @@
 
 # -----------------------------------------------------------------------------
 # scripts/esxi_replace_ssl_certs.sh
-# Version: 1.2.5
+# Version: 1.2.6
 # -----------------------------------------------------------------------------
 # ESXi SSL Certificate Replacement Script
 #
@@ -11,6 +11,7 @@
 # private key (rui.key) files used by the ESXi web interface and management services.
 #
 # FEATURES:
+# - SSH ControlMaster for persistent connection reuse (improved efficiency)
 # - Automatic SSH connection handling (supports both SSH keys and password authentication)
 # - SSH alias support (works seamlessly with SSH config files and includes)
 # - Comprehensive SSL certificate validation (format, expiration, key matching)
@@ -45,6 +46,7 @@
 # - Comprehensive validation of certificate files before installation
 # - Verification that certificate and private key match
 # - Service status checks to ensure proper operation after changes
+# - SSH ControlMaster for reliable connection reuse throughout the process
 #
 # OUTPUT:
 # - Real-time progress logging to console
@@ -83,6 +85,10 @@ SSL_KEY_FILE="~/Projects/git.certgen/domains/lan/certs/vmware.lan.key"      # Pa
 # SSH connection options
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30"
 
+# SSH ControlMaster configuration
+CONTROL_SOCKET_DIR="/tmp"
+CONTROL_SOCKET_PATH="$CONTROL_SOCKET_DIR/ssh-control-$$-$(date +%s)"
+
 # ESXi SSL file paths
 ESXI_CERT_PATH="/etc/vmware/ssl/rui.crt"
 ESXI_KEY_PATH="/etc/vmware/ssl/rui.key"
@@ -107,7 +113,19 @@ error_exit() {
     # Log error message and exit with status 1
     # Parameters: $1 = error message
     log "ERROR: $1"
+    cleanup_ssh_connection
     exit 1
+}
+
+cleanup_ssh_connection() {
+    # Clean up SSH ControlMaster connection and socket file
+    # Called on script exit or error
+    if [[ -S "$CONTROL_SOCKET_PATH" ]]; then
+        log "Cleaning up SSH ControlMaster connection..."
+        ssh -S "$CONTROL_SOCKET_PATH" -O exit "$ESXI_USER@$ESXI_HOST" 2>/dev/null || true
+        rm -f "$CONTROL_SOCKET_PATH" 2>/dev/null || true
+        log "SSH connection cleanup completed"
+    fi
 }
 
 expand_path() {
@@ -197,6 +215,11 @@ check_prerequisites() {
     command -v sshpass >/dev/null 2>&1 || error_exit "sshpass is required but not installed"
     command -v ssh >/dev/null 2>&1 || error_exit "ssh is required but not installed"
     
+    # Check if control socket directory exists and is writable
+    if [[ ! -d "$CONTROL_SOCKET_DIR" ]] || [[ ! -w "$CONTROL_SOCKET_DIR" ]]; then
+        error_exit "Control socket directory $CONTROL_SOCKET_DIR is not writable"
+    fi
+    
     # Expand file paths
     SSL_CERT_FILE=$(expand_path "$SSL_CERT_FILE")
     SSL_KEY_FILE=$(expand_path "$SSL_KEY_FILE")
@@ -213,7 +236,6 @@ check_prerequisites() {
     log "Using SSL certificate: $SSL_CERT_FILE"
     log "Using SSL private key: $SSL_KEY_FILE"
 }
-
 
 test_ssh_connection() {
     # Test SSH connectivity to ESXi host, handling both SSH keys and password authentication
@@ -246,23 +268,54 @@ test_ssh_connection() {
     fi
 }
 
-
+establish_ssh_connection() {
+    # Establish SSH ControlMaster connection to ESXi host
+    # Uses authentication method determined in test_ssh_connection()
+    # Sets up persistent connection for all subsequent operations
+    log "Establishing SSH ControlMaster connection to $ESXI_HOST..."
+    
+    # Set up trap to cleanup connection on script exit
+    trap cleanup_ssh_connection EXIT
+    
+    if [[ "$USE_SSH_KEY_AUTH" == true ]]; then
+        # Establish ControlMaster with SSH key authentication
+        if ssh $SSH_OPTS -M -S "$CONTROL_SOCKET_PATH" -f -N "$ESXI_USER@$ESXI_HOST" 2>/dev/null; then
+            log "SSH ControlMaster connection established successfully (using SSH key)"
+        else
+            error_exit "Cannot establish SSH ControlMaster connection using SSH key authentication"
+        fi
+    else
+        # Establish ControlMaster with password authentication
+        if sshpass -p "$ESXI_PASSWORD" ssh $SSH_OPTS -M -S "$CONTROL_SOCKET_PATH" -f -N "$ESXI_USER@$ESXI_HOST" 2>/dev/null; then
+            log "SSH ControlMaster connection established successfully (using password)"
+            # Store password for reuse by subsequent connections
+            export SSHPASS="$ESXI_PASSWORD"
+        else
+            error_exit "Cannot establish SSH ControlMaster connection using password authentication"
+        fi
+    fi
+}
 
 execute_remote_command() {
-    # Execute command on remote ESXi host via SSH and capture output
-    # Uses authentication method determined in test_ssh_connection()
+    # Execute command on remote ESXi host via SSH using established ControlMaster connection
+    # Reuses the persistent connection established by establish_ssh_connection()
     # Parameters: $1 = command to execute, $2 = description for logging
     local command="$1"
     local description="$2"
 
     log "Executing: $description"
 
-    # Execute command and capture output using the appropriate authentication method
+    # Verify ControlMaster connection is still active
+    if ! ssh -S "$CONTROL_SOCKET_PATH" -O check "$ESXI_USER@$ESXI_HOST" >/dev/null 2>&1; then
+        error_exit "SSH ControlMaster connection is not active"
+    fi
+
+    # Execute command using the established ControlMaster connection
     local output
     
     if [[ "$USE_SSH_KEY_AUTH" == true ]]; then
-        # Use SSH key authentication
-        if output=$(ssh $SSH_OPTS "$ESXI_USER@$ESXI_HOST" "$command" 2>&1); then
+        # Use SSH key authentication with ControlMaster
+        if output=$(ssh -S "$CONTROL_SOCKET_PATH" "$ESXI_USER@$ESXI_HOST" "$command" 2>&1); then
             # Log each line of output to both console and file
             while IFS= read -r line; do
                 echo "$line" >&2
@@ -276,8 +329,8 @@ execute_remote_command() {
             error_exit "Failed to execute: $description (SSH key authentication failed)"
         fi
     else
-        # Use password authentication
-        if output=$(sshpass -p "$ESXI_PASSWORD" ssh $SSH_OPTS "$ESXI_USER@$ESXI_HOST" "$command" 2>&1); then
+        # Use password authentication with ControlMaster
+        if output=$(sshpass -e ssh -S "$CONTROL_SOCKET_PATH" "$ESXI_USER@$ESXI_HOST" "$command" 2>&1); then
             # Log each line of output to both console and file
             while IFS= read -r line; do
                 echo "$line" >&2
@@ -292,7 +345,6 @@ execute_remote_command() {
         fi
     fi
 }
-
 
 validate_ssl_files() {
     # Comprehensive validation of SSL certificate and private key files
@@ -599,27 +651,31 @@ main() {
     # Step 3: Test SSH connection FIRST (this sets USE_SSH_KEY_AUTH)
     test_ssh_connection
     
-    # Step 4: Create backup of existing certificates
+    # Step 4: Establish SSH ControlMaster connection (uses method from test_ssh_connection)
+    establish_ssh_connection
+    
+    # Step 5: Create backup of existing certificates
     backup_existing_certificates
     
-    # Step 5: Replace SSL certificates with new ones
+    # Step 6: Replace SSL certificates with new ones
     replace_ssl_certificates
     
-    # Step 6: Restart hostd service to apply changes
+    # Step 7: Restart hostd service to apply changes
     restart_hostd_service
     
-    # Step 7: Verify SSL certificate installation
+    # Step 8: Verify SSL certificate installation
     verify_ssl_installation
     
-    # Step 8: Test HTTPS connectivity
+    # Step 9: Test HTTPS connectivity
     test_https_connection
     
     log "SSL certificate replacement completed successfully!"
     log "ESXi web interface should now use the new SSL certificates"
     log "You can access the host at: https://$ESXI_HOST/"
     log "Complete log saved to: $(pwd)/$LOG_FILE"
+    
+    # Cleanup is handled by the trap
 }
-
 
 # =============================================================================
 # SCRIPT EXECUTION
