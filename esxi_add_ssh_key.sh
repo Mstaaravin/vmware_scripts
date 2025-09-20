@@ -2,7 +2,7 @@
 
 # -----------------------------------------------------------------------------
 # scripts/esxi_add_ssh_key.sh
-# Version: 1.2.1
+# Version: 1.2.2
 # -----------------------------------------------------------------------------
 # ESXi SSH Key Installation Script
 #
@@ -11,6 +11,7 @@
 # for configuring SSH key-based access to ESXi management interfaces.
 #
 # FEATURES:
+# - SSH ControlMaster for persistent connection reuse (improved efficiency)
 # - Automatic SSH connection handling (password-based authentication for initial setup)
 # - Comprehensive SSH key validation (format, type, and structure verification)
 # - Automatic backup of existing authorized_keys before modifications
@@ -45,6 +46,7 @@
 # - Comprehensive validation of SSH key format and structure
 # - Service status verification after changes
 # - Non-destructive operation (existing keys are preserved)
+# - SSH ControlMaster for reliable connection reuse throughout the process
 #
 # OUTPUT:
 # - Real-time progress logging to console
@@ -82,6 +84,13 @@ PUBKEY_FILE="~/.ssh/keys/homelab/oralab.pub"               # Path to SSH public 
 # SSH connection options
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30"
 
+# SSH ControlMaster configuration
+CONTROL_SOCKET_DIR="/tmp"
+CONTROL_SOCKET_PATH="$CONTROL_SOCKET_DIR/ssh-control-$$-$(date +%s)"
+
+# Global variable to track authentication method
+USE_SSH_KEY_AUTH=false
+
 # =============================================================================
 # FUNCTIONS
 # =============================================================================
@@ -102,7 +111,19 @@ error_exit() {
     # Log error message and exit with status 1
     # Parameters: $1 = error message
     log "ERROR: $1"
+    cleanup_ssh_connection
     exit 1
+}
+
+cleanup_ssh_connection() {
+    # Clean up SSH ControlMaster connection and socket file
+    # Called on script exit or error
+    if [[ -S "$CONTROL_SOCKET_PATH" ]]; then
+        log "Cleaning up SSH ControlMaster connection..."
+        ssh -S "$CONTROL_SOCKET_PATH" -O exit "$ESXI_USER@$ESXI_HOST" 2>/dev/null || true
+        rm -f "$CONTROL_SOCKET_PATH" 2>/dev/null || true
+        log "SSH connection cleanup completed"
+    fi
 }
 
 expand_path() {
@@ -170,6 +191,11 @@ check_prerequisites() {
     command -v sshpass >/dev/null 2>&1 || error_exit "sshpass is required but not installed"
     command -v ssh >/dev/null 2>&1 || error_exit "ssh is required but not installed"
 
+    # Check if control socket directory exists and is writable
+    if [[ ! -d "$CONTROL_SOCKET_DIR" ]] || [[ ! -w "$CONTROL_SOCKET_DIR" ]]; then
+        error_exit "Control socket directory $CONTROL_SOCKET_DIR is not writable"
+    fi
+
     # Expand file paths
     PUBKEY_FILE=$(expand_path "$PUBKEY_FILE")
 
@@ -183,30 +209,44 @@ check_prerequisites() {
     log "Using SSH public key: $PUBKEY_FILE"
 }
 
-test_ssh_connection() {
-    # Test SSH connectivity to ESXi host using password authentication
-    # Verifies that the host is reachable and credentials are correct
-    log "Testing SSH connection to $ESXI_HOST..."
+establish_ssh_connection() {
+    # Establish SSH ControlMaster connection to ESXi host using password authentication
+    # This script specifically uses password auth for initial setup before key installation
+    log "Establishing SSH ControlMaster connection to $ESXI_HOST..."
 
-    if sshpass -p "$ESXI_PASSWORD" ssh $SSH_OPTS "$ESXI_USER@$ESXI_HOST" "echo 'SSH connection successful'" >/dev/null 2>&1; then
-        log "SSH connection to $ESXI_HOST successful"
+    # Set up trap to cleanup connection on script exit
+    trap cleanup_ssh_connection EXIT
+
+    # This script uses password authentication for initial setup (before SSH key is installed)
+    # Test password-based connection and establish ControlMaster
+    if sshpass -p "$ESXI_PASSWORD" ssh $SSH_OPTS -M -S "$CONTROL_SOCKET_PATH" -f -N "$ESXI_USER@$ESXI_HOST" 2>/dev/null; then
+        log "SSH ControlMaster connection established successfully (using password)"
+        USE_SSH_KEY_AUTH=false
+        
+        # Store password for reuse by subsequent connections
+        export SSHPASS="$ESXI_PASSWORD"
     else
-        error_exit "Cannot establish SSH connection to $ESXI_HOST"
+        error_exit "Cannot establish SSH ControlMaster connection to $ESXI_HOST using password authentication"
     fi
 }
 
 execute_remote_command() {
-    # Execute command on remote ESXi host via SSH and capture output
-    # Logs both command execution and output to console and log file
+    # Execute command on remote ESXi host via SSH using established ControlMaster connection
+    # Reuses the persistent connection established by establish_ssh_connection()
     # Parameters: $1 = command to execute, $2 = description for logging
     local command="$1"
     local description="$2"
 
     log "Executing: $description"
 
-    # Execute command and capture output
+    # Verify ControlMaster connection is still active
+    if ! ssh -S "$CONTROL_SOCKET_PATH" -O check "$ESXI_USER@$ESXI_HOST" >/dev/null 2>&1; then
+        error_exit "SSH ControlMaster connection is not active"
+    fi
+
+    # Execute command using password authentication with ControlMaster
     local output
-    if output=$(sshpass -p "$ESXI_PASSWORD" ssh $SSH_OPTS "$ESXI_USER@$ESXI_HOST" "$command" 2>&1); then
+    if output=$(sshpass -e ssh -S "$CONTROL_SOCKET_PATH" "$ESXI_USER@$ESXI_HOST" "$command" 2>&1); then
         # Log each line of output to both console and file
         while IFS= read -r line; do
             echo "$line" >&2
@@ -385,8 +425,8 @@ main() {
     # Step 3: Validate SSH key format and structure
     validate_ssh_key
 
-    # Step 4: Test SSH connection with password
-    test_ssh_connection
+    # Step 4: Establish SSH ControlMaster connection with password
+    establish_ssh_connection
 
     # Step 5: Add SSH public key to authorized_keys
     add_ssh_key
@@ -404,6 +444,8 @@ main() {
     log "You should now be able to connect using SSH key authentication:"
     log "  ssh -i ${PUBKEY_FILE%.pub} $ESXI_USER@$ESXI_HOST"
     log "Complete log saved to: $(pwd)/$LOG_FILE"
+    
+    # Cleanup is handled by the trap
 }
 
 # =============================================================================
